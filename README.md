@@ -9,7 +9,11 @@ binary at runtime).
 
 - Uses **long-polling** (`getUpdates`) — no webhook, no inbound port, works
   behind NAT without a public IP.
-- **Private chats:** replies to every message.
+- **Access control (fail-closed):** only messages from `ALLOWED_USERS` or in
+  `ALLOWED_CHATS` are processed; everything else is silently dropped and
+  logged with the sender/chat IDs. The bot refuses to start with no
+  allowlist unless `ALLOW_ALL=true` is set explicitly.
+- **Private chats:** replies to every message (from an allowed user).
 - **Group chats:** replies only when the bot is `@mentioned` (the mention is
   detected via Telegram message entities and stripped before the text is sent
   to Claude) or when someone replies to one of the bot's own messages.
@@ -40,6 +44,9 @@ Environment variables (see `.env.example`):
 | Variable                  | Required   | Default  | Description                                            |
 | ------------------------- | ---------- | -------- | ------------------------------------------------------ |
 | `TELEGRAM_BOT_TOKEN`      | yes        | —        | Bot token from @BotFather                              |
+| `ALLOWED_USERS`           | see below  | (empty)  | Comma-separated user IDs or @usernames allowed anywhere (incl. private chat) |
+| `ALLOWED_CHATS`           | see below  | (empty)  | Comma-separated group/channel IDs or @usernames; anyone in an allowed chat may use the bot there (not consulted for private chats) |
+| `ALLOW_ALL`               | see below  | (empty)  | `true` opens the bot to everyone (explicit opt-out)    |
 | `CLAUDE_CODE_OAUTH_TOKEN` | in Docker  | —        | Subscription token from `claude setup-token`           |
 | `CLAUDE_MODEL`            | no         | (empty)  | Model alias (`sonnet`, `opus`) or full model ID        |
 | `SYSTEM_PROMPT`           | no         | (empty)  | Appended to Claude Code's default system prompt        |
@@ -53,6 +60,16 @@ where Claude Code is logged in with your subscription account, and paste the
 resulting token into `.env`. When running the bot locally instead of in
 Docker, you can skip the token entirely if you have already run
 `claude login` — the CLI will use your stored credentials.
+
+At least one of `ALLOWED_USERS` / `ALLOWED_CHATS` must be set (or
+`ALLOW_ALL=true`); otherwise the bot exits at startup. To find an ID, start
+the bot while you are **not** yet allowlisted (e.g. `ALLOWED_USERS=@nobody`),
+send it a message, and read the IDs from the `blocked message from user …`
+log line; group/channel IDs are negative (the bot rejects entries whose sign
+doesn't match the list at startup). Prefer numeric IDs — usernames can be
+changed or reassigned, and a freed chat @username could be claimed by
+someone else. Note that allowing a chat allows *every member* of that chat,
+so think twice before allowlisting a public group.
 
 For group mentions to work in all messages, either mention the bot explicitly
 or disable BotFather's *Group Privacy* mode so the bot can see group messages

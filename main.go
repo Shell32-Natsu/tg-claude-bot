@@ -76,6 +76,9 @@ type config struct {
 	claudeBin     string
 	idleTimeout   time.Duration
 	maxAge        time.Duration
+	allowedUsers  allowList
+	allowedChats  allowList
+	allowAll      bool // explicit ALLOW_ALL=true opt-out of access control
 }
 
 func loadConfig() (config, error) {
@@ -88,6 +91,13 @@ func loadConfig() (config, error) {
 		claudeBin:     os.Getenv("CLAUDE_BIN"),
 		idleTimeout:   defaultIdleTimeout,
 		maxAge:        defaultMaxAge,
+	}
+	if v := os.Getenv("ALLOW_ALL"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return cfg, fmt.Errorf("ALLOW_ALL must be a boolean, got %q", v)
+		}
+		cfg.allowAll = b
 	}
 	if cfg.telegramToken == "" {
 		return cfg, errors.New("TELEGRAM_BOT_TOKEN is required")
@@ -105,7 +115,76 @@ func loadConfig() (config, error) {
 	if err := envDuration("SESSION_MAX_AGE_DAYS", 24*time.Hour, &cfg.maxAge); err != nil {
 		return cfg, err
 	}
+	var err error
+	if cfg.allowedUsers, err = parseAllowList("ALLOWED_USERS", false); err != nil {
+		return cfg, err
+	}
+	if cfg.allowedChats, err = parseAllowList("ALLOWED_CHATS", true); err != nil {
+		return cfg, err
+	}
+	// Fail closed: the bot drives Claude on the operator's account, so an
+	// unset or lost allowlist must not silently open it to everyone.
+	if cfg.allowedUsers.empty() && cfg.allowedChats.empty() && !cfg.allowAll {
+		return cfg, errors.New("no access control configured: set ALLOWED_USERS and/or ALLOWED_CHATS (comma-separated IDs or @usernames), or set ALLOW_ALL=true to explicitly allow everyone")
+	}
 	return cfg, nil
+}
+
+// allowList matches Telegram users or chats by numeric ID (stable, the
+// recommended form) or by @username (changeable, a convenience).
+type allowList struct {
+	ids   map[int64]bool
+	names map[string]bool // lowercase, without the leading @
+}
+
+func (a allowList) size() int {
+	return len(a.ids) + len(a.names)
+}
+
+func (a allowList) empty() bool {
+	return a.size() == 0
+}
+
+// match reports whether the given ID or username (may be empty) is listed.
+func (a allowList) match(id int64, username string) bool {
+	if a.ids[id] {
+		return true
+	}
+	return username != "" && a.names[strings.ToLower(username)]
+}
+
+// parseAllowList reads a comma-separated env var whose entries are numeric
+// Telegram IDs or @usernames. wantNegative distinguishes chat lists (group
+// and channel IDs are negative) from user lists (user IDs are positive), so
+// an ID pasted into the wrong variable fails at startup instead of silently
+// never matching.
+func parseAllowList(name string, wantNegative bool) (allowList, error) {
+	a := allowList{ids: make(map[int64]bool), names: make(map[string]bool)}
+	for _, entry := range strings.Split(os.Getenv(name), ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(entry, "@"); ok {
+			if rest == "" {
+				return a, fmt.Errorf("%s: empty @username entry", name)
+			}
+			a.names[strings.ToLower(rest)] = true
+			continue
+		}
+		id, err := strconv.ParseInt(entry, 10, 64)
+		if err != nil {
+			return a, fmt.Errorf("%s: entry %q is neither a numeric ID nor an @username", name, entry)
+		}
+		if wantNegative && id >= 0 {
+			return a, fmt.Errorf("%s: entry %q looks like a user ID (group/channel IDs are negative)", name, entry)
+		}
+		if !wantNegative && id <= 0 {
+			return a, fmt.Errorf("%s: entry %q looks like a chat ID (user IDs are positive)", name, entry)
+		}
+		a.ids[id] = true
+	}
+	return a, nil
 }
 
 // envDuration overwrites *dst with the named env var (a positive integer)
@@ -153,8 +232,9 @@ type tgUser struct {
 }
 
 type tgChat struct {
-	ID   int64  `json:"id"`
-	Type string `json:"type"`
+	ID       int64  `json:"id"`
+	Type     string `json:"type"`
+	Username string `json:"username"`
 }
 
 type tgEntity struct {
@@ -373,7 +453,12 @@ func main() {
 	}
 	b.botID = me.ID
 	b.botUsername = me.Username
-	log.Printf("started as @%s (model %q, session idle timeout %v, max age %v)", b.botUsername, cfg.model, cfg.idleTimeout, cfg.maxAge)
+	access := fmt.Sprintf("%d allowed user(s), %d allowed chat(s)",
+		cfg.allowedUsers.size(), cfg.allowedChats.size())
+	if cfg.allowAll {
+		access = "ALLOW_ALL — open to everyone"
+	}
+	log.Printf("started as @%s (model %q, session idle timeout %v, max age %v, access: %s)", b.botUsername, cfg.model, cfg.idleTimeout, cfg.maxAge, access)
 
 	go b.janitorLoop()
 	b.pollLoop()
@@ -507,9 +592,44 @@ func (b *bot) pollLoop() {
 			if !ok || strings.TrimSpace(prompt) == "" {
 				continue
 			}
+			if !b.allowed(msg) {
+				// Drop silently (replying would invite probing). Checking
+				// after promptFor means only messages the bot would have
+				// answered are logged — not bystander group chatter — and
+				// the log line gives the operator the IDs to allowlist.
+				log.Printf("blocked message from user %s in chat %s",
+					idLabel(msg.From.ID, msg.From.Username), idLabel(msg.Chat.ID, msg.Chat.Username))
+				continue
+			}
 			go b.handleMessage(msg, prompt)
 		}
 	}
+}
+
+// idLabel formats a Telegram ID with its username, if there is one, for the
+// blocked-message log the operator uses to discover IDs to allowlist.
+func idLabel(id int64, username string) string {
+	if username == "" {
+		return strconv.FormatInt(id, 10)
+	}
+	return fmt.Sprintf("%d (@%s)", id, username)
+}
+
+// allowed reports whether the message passes access control: the group or
+// channel is allowlisted (anyone in an allowed chat may use the bot there)
+// or the sender is allowlisted (an allowed user may use the bot anywhere,
+// including private chat). ALLOWED_CHATS is deliberately not consulted for
+// private chats — there chat ID and username mirror the user's, which would
+// let a chat entry silently double as a personal grant. ALLOW_ALL=true
+// disables the check entirely.
+func (b *bot) allowed(msg *tgMessage) bool {
+	if b.cfg.allowAll {
+		return true
+	}
+	if msg.Chat.Type != "private" && b.cfg.allowedChats.match(msg.Chat.ID, msg.Chat.Username) {
+		return true
+	}
+	return b.cfg.allowedUsers.match(msg.From.ID, msg.From.Username)
 }
 
 // promptFor decides whether the bot should answer msg and returns the text to
