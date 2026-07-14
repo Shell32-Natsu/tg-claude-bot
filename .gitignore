@@ -1,0 +1,7 @@
+# Secrets
+.env
+
+# Build artifacts
+/bot
+/tg-claude-bot
+*.exe

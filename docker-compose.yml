@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    image: tg-claude-bot
+    env_file: .env
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    # Long-polling only — no ports exposed; outbound HTTPS is all it needs.
