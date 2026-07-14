@@ -24,7 +24,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -416,8 +415,8 @@ type bot struct {
 	workBase    string
 	sessions    *sessionManager
 
-	// claudeEnv is the child environment for claude runs, with
-	// ANTHROPIC_API_KEY dropped so replies always use subscription auth.
+	// claudeEnv is the minimal child environment for claude runs; see
+	// minimalClaudeEnv.
 	claudeEnv []string
 
 	// sem bounds concurrent claude processes. It is taken only around the
@@ -472,16 +471,14 @@ func main() {
 	}
 
 	b := &bot{
-		cfg:      cfg,
-		workBase: workBase,
-		sessions: newSessionManager(cfg.idleTimeout, cfg.maxAge),
-		claudeEnv: slices.DeleteFunc(os.Environ(), func(kv string) bool {
-			return strings.HasPrefix(kv, "ANTHROPIC_API_KEY=")
-		}),
-		sem:      make(chan struct{}, maxConcurrent),
-		redactor: strings.NewReplacer(redactPairs...),
-		blocked:  make(map[int64]*blockedState),
-		tgClient: &http.Client{Timeout: (pollTimeout + 20) * time.Second},
+		cfg:       cfg,
+		workBase:  workBase,
+		sessions:  newSessionManager(cfg.idleTimeout, cfg.maxAge),
+		claudeEnv: minimalClaudeEnv(),
+		sem:       make(chan struct{}, maxConcurrent),
+		redactor:  strings.NewReplacer(redactPairs...),
+		blocked:   make(map[int64]*blockedState),
+		tgClient:  &http.Client{Timeout: (pollTimeout + 20) * time.Second},
 	}
 	b.reactionOK.Store(true)
 	b.sessions.cleanup = b.cleanupSession
@@ -503,6 +500,44 @@ func main() {
 
 	go b.janitorLoop()
 	b.pollLoop()
+}
+
+// claudeEnvPrefixes lists the environment entries passed to the claude
+// child process: locale/paths, its own configuration (CLAUDE_*, DISABLE_*,
+// ANTHROPIC_* — for gateways and provider settings; CLAUDE_MODEL/CLAUDE_BIN
+// are bot vars that ride along harmlessly), CA bundles, and proxies.
+// Everything else — bot secrets like TELEGRAM_BOT_TOKEN, the allowlists,
+// SYSTEM_PROMPT — is withheld as defense-in-depth: the model has no tool
+// that reads the environment today, and this keeps it that way if the tool
+// surface ever widens.
+var claudeEnvPrefixes = []string{
+	"HOME=", "PATH=", "TMPDIR=", "TERM=", "USER=", "LOGNAME=", "SHELL=",
+	"LANG=", "LC_", "TZ=", "XDG_",
+	"CLAUDE_", "ANTHROPIC_", "DISABLE_",
+	"HTTP_PROXY=", "HTTPS_PROXY=", "NO_PROXY=",
+	"http_proxy=", "https_proxy=", "no_proxy=",
+	"SSL_CERT_FILE=", "SSL_CERT_DIR=", "NODE_EXTRA_CA_CERTS=",
+	"REQUESTS_CA_BUNDLE=", "CURL_CA_BUNDLE=",
+}
+
+func minimalClaudeEnv() []string {
+	// Non-nil even when empty: exec.Cmd treats a nil Env as "inherit the
+	// whole parent environment", which would silently undo the filtering.
+	env := []string{}
+	for _, kv := range os.Environ() {
+		// The one ANTHROPIC_* exception: never pass the API key, so
+		// replies always bill to the subscription (OAuth) account.
+		if strings.HasPrefix(kv, "ANTHROPIC_API_KEY=") {
+			continue
+		}
+		for _, p := range claudeEnvPrefixes {
+			if strings.HasPrefix(kv, p) {
+				env = append(env, kv)
+				break
+			}
+		}
+	}
+	return env
 }
 
 // janitorLoop periodically expires stale sessions (disk cleanup happens via
@@ -927,6 +962,10 @@ func (b *bot) askClaude(s *session, prompt string) (string, error) {
 		"--tools", claudeTools,
 		"--allowedTools", claudeTools,
 		"--strict-mcp-config",
+		// Message text is conversation input only: a chat message starting
+		// with "/" (Telegram users type /start reflexively) must never
+		// trigger a Claude Code skill.
+		"--disable-slash-commands",
 	}
 	if s.started {
 		args = append(args, "--resume", s.id)

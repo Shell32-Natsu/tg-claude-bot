@@ -29,8 +29,10 @@ binary at runtime).
   context doesn't accumulate forever.
 - Claude's tool access is restricted to **web search** only (which runs
   server-side at Anthropic) — no shell, no file access, no URL fetching from
-  the bot's network, no MCP servers — since chat messages are untrusted
-  input.
+  the bot's network, no MCP servers, and no slash commands/skills (a chat
+  message starting with `/` is just text) — since chat messages are
+  untrusted input. The `claude` process also gets a minimal environment, so
+  bot secrets like the Telegram token are never visible to it.
 - Each session runs in its own **empty temporary directory** (under the OS
   temp dir), deleted when the session expires and cleared on bot restart.
 - Reacts to a message it's about to answer with 👀 (configurable via
@@ -119,8 +121,12 @@ go run .
 
 - Session transcripts live under `~/.claude/projects/`; the bot deletes a
   session's transcript when it expires it after an hour of inactivity.
-- `ANTHROPIC_API_KEY` is deliberately stripped from the CLI's environment so
-  replies always bill to the subscription, never to an API key.
+- The `claude` process runs with a filtered environment: only locale/path
+  basics, `CLAUDE_*`/`ANTHROPIC_*`/`DISABLE_*` configuration, CA bundles, and
+  proxy settings pass through — bot secrets (`TELEGRAM_BOT_TOKEN`, the
+  allowlists, `SYSTEM_PROMPT`) never reach it. `ANTHROPIC_API_KEY` is the one
+  exception in the pass-through set: it is deliberately stripped so replies
+  always bill to the subscription, never to an API key.
 
 ## CI
 
