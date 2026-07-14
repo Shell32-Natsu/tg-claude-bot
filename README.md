@@ -33,9 +33,18 @@ binary at runtime).
   input.
 - Each session runs in its own **empty temporary directory** (under the OS
   temp dir), deleted when the session expires and cleared on bot restart.
-- Shows a "typing…" chat action while waiting for Claude.
-- Splits replies longer than Telegram's 4096-character limit into multiple
-  messages (capped at 4 messages per answer to prevent chat flooding).
+- Reacts to a message it's about to answer with 👀 (configurable via
+  `REACTION_EMOJI`, must be from Telegram's reaction set; `none` disables),
+  then shows a "typing…" chat action while waiting for Claude.
+- Renders Claude's Markdown in Telegram: replies are converted to Telegram
+  HTML (bold, strikethrough, inline code, code blocks, links, bullets;
+  headers become bold), with a plain-text fallback if Telegram rejects the
+  formatting. Claude is steered toward Telegram-friendly formatting via a
+  built-in system prompt (prepended to your `SYSTEM_PROMPT`).
+- Splits long replies into multiple messages, well below Telegram's
+  4096-character limit to leave room for formatting (capped at 4 messages
+  per answer to prevent chat flooding; code blocks cut by a split are
+  closed and reopened so each message renders correctly).
 - Ignores messages from other bots.
 - Verifies Claude Code authentication at startup (`claude auth status`) and
   exits with a clear error instead of failing message-by-message.
@@ -53,6 +62,7 @@ Environment variables (see `.env.example`):
 | `CLAUDE_CODE_OAUTH_TOKEN` | in Docker  | —        | Subscription token from `claude setup-token`           |
 | `CLAUDE_MODEL`            | no         | (empty)  | Model alias (`sonnet`, `opus`) or full model ID        |
 | `SYSTEM_PROMPT`           | no         | (empty)  | Appended to Claude Code's default system prompt        |
+| `REACTION_EMOJI`          | no         | `👀`     | Ack reaction on answered messages (`none` disables)    |
 | `SESSION_IDLE_MINUTES`    | no         | `60`     | Drop a chat's session after this much inactivity       |
 | `SESSION_MAX_AGE_DAYS`    | no         | `7`      | Restart a chat's session (fresh context) after this    |
 | `TELEGRAM_API_BASE`       | no         | `https://api.telegram.org` | For self-hosted Bot API servers      |

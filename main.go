@@ -16,24 +16,32 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 )
 
 const (
-	// telegramMsgLimit is Telegram's maximum message length. We split a bit
-	// below it to leave margin for how Telegram counts characters.
-	telegramMsgLimit = 4000
+	// telegramMsgLimit is Telegram's maximum message length. We split well
+	// below it to leave margin for the HTML tags and escapes the Markdown
+	// conversion adds.
+	telegramMsgLimit = 3500
+
+	// telegramStylePrompt keeps Claude's Markdown inside the subset this bot
+	// converts to Telegram HTML; it is always appended to the system prompt.
+	telegramStylePrompt = "Your replies are shown in Telegram, which renders only limited formatting. Use only: **bold**, `inline code`, fenced ``` code blocks, and [links](https://example.com). Never use headers, tables, italics, or nested lists — write plain paragraphs and simple '-' bullet lists instead. Keep replies concise; this is a chat app."
 
 	// maxReplyParts caps how many Telegram messages one answer may span, so
 	// a prompt that coaxes Claude into a huge dump can't flood the chat.
@@ -67,6 +75,12 @@ const (
 	// possibly including web searches).
 	claudeTimeout = 5 * time.Minute
 
+	// defaultReaction is the emoji reaction set on a message the bot is
+	// about to answer, as an immediate "seen, working on it" acknowledgment.
+	// Telegram only accepts emoji from its fixed reaction set; override
+	// with REACTION_EMOJI (set it to "none" to disable).
+	defaultReaction = "👀"
+
 	// claudeTools is the only tool surface exposed to the model. Telegram
 	// messages are untrusted input, so no Bash, no file tools, no MCP —
 	// and no WebFetch, which would fetch attacker-chosen URLs from inside
@@ -85,7 +99,8 @@ type config struct {
 	maxAge        time.Duration
 	allowedUsers  allowList
 	allowedChats  allowList
-	allowAll      bool // explicit ALLOW_ALL=true opt-out of access control
+	allowAll      bool   // explicit ALLOW_ALL=true opt-out of access control
+	reactionEmoji string // reaction set on messages the bot is about to answer; "" = disabled
 }
 
 func loadConfig() (config, error) {
@@ -98,6 +113,15 @@ func loadConfig() (config, error) {
 		claudeBin:     os.Getenv("CLAUDE_BIN"),
 		idleTimeout:   defaultIdleTimeout,
 		maxAge:        defaultMaxAge,
+		reactionEmoji: defaultReaction,
+	}
+	// Empty keeps the default (docker env_file passes unset vars as empty);
+	// only the explicit "none" disables the acknowledgment reaction.
+	if v := os.Getenv("REACTION_EMOJI"); v != "" {
+		if strings.EqualFold(v, "none") {
+			v = ""
+		}
+		cfg.reactionEmoji = v
 	}
 	if v := os.Getenv("ALLOW_ALL"); v != "" {
 		b, err := strconv.ParseBool(v)
@@ -408,6 +432,10 @@ type bot struct {
 	blockedMu sync.Mutex
 	blocked   map[int64]*blockedState
 
+	// reactionOK flips off permanently if Telegram rejects the configured
+	// reaction emoji, so a bad REACTION_EMOJI fails once, not per message.
+	reactionOK atomic.Bool
+
 	// tgClient's timeout must exceed pollTimeout or long polls would be
 	// cancelled by our own client.
 	tgClient *http.Client
@@ -455,6 +483,7 @@ func main() {
 		blocked:  make(map[int64]*blockedState),
 		tgClient: &http.Client{Timeout: (pollTimeout + 20) * time.Second},
 	}
+	b.reactionOK.Store(true)
 	b.sessions.cleanup = b.cleanupSession
 	b.checkClaudeAuth()
 	b.cleanupOrphanedProjects()
@@ -671,12 +700,39 @@ func (b *bot) replyBlocked(msg *tgMessage) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := b.sendMessage(ctx, msg.Chat.ID, text, msg.MessageID); err != nil {
+	if err := b.send(ctx, msg.Chat.ID, text, "", msg.MessageID); err != nil {
 		log.Printf("blocked notice (chat %d): %v", msg.Chat.ID, b.redact(err))
 		// Don't burn the cooldown on a failed send — let a retry through.
 		b.blockedMu.Lock()
 		delete(b.blocked, msg.Chat.ID)
 		b.blockedMu.Unlock()
+	}
+}
+
+// react sets the acknowledgment emoji reaction on a message the bot is about
+// to answer, so the sender sees it was picked up before Claude finishes.
+// Best-effort: failures (e.g. an emoji outside Telegram's reaction set, or a
+// group where reactions are restricted) are logged and otherwise ignored.
+func (b *bot) react(msg *tgMessage) {
+	if !b.reactionOK.Load() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	err := b.tgCall(ctx, "setMessageReaction", map[string]any{
+		"chat_id":    msg.Chat.ID,
+		"message_id": msg.MessageID,
+		"reaction":   []map[string]any{{"type": "emoji", "emoji": b.cfg.reactionEmoji}},
+	}, nil)
+	if err != nil {
+		log.Printf("setMessageReaction (chat %d): %v", msg.Chat.ID, b.redact(err))
+		// A 400 means the configured emoji isn't in Telegram's reaction
+		// set; stop trying rather than fail on every message. Other errors
+		// (chat-level restrictions, transient) don't disable it globally.
+		if strings.Contains(err.Error(), "status 400") && strings.Contains(err.Error(), "REACTION_INVALID") {
+			log.Printf("REACTION_EMOJI %q rejected by Telegram; disabling reactions", b.cfg.reactionEmoji)
+			b.reactionOK.Store(false)
+		}
 	}
 }
 
@@ -774,6 +830,9 @@ func (b *bot) stripMention(text string, entities []tgEntity) (string, bool) {
 // run itself is bounded inside askClaude, and reply delivery gets its own
 // context so a slow turn can't eat the send budget.
 func (b *bot) handleMessage(msg *tgMessage, prompt string) {
+	if b.cfg.reactionEmoji != "" {
+		go b.react(msg)
+	}
 	typingCtx, stopTypingCtx := context.WithCancel(context.Background())
 	stopTyping := b.typeWhile(typingCtx, msg.Chat.ID)
 
@@ -797,6 +856,7 @@ func (b *bot) handleMessage(msg *tgMessage, prompt string) {
 		parts = parts[:maxReplyParts]
 		parts[maxReplyParts-1] += "\n[reply truncated]"
 	}
+	balanceFences(parts)
 
 	sendCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -807,7 +867,14 @@ func (b *bot) handleMessage(msg *tgMessage, prompt string) {
 		if i == 0 {
 			replyTo = msg.MessageID
 		}
-		if err := b.sendMessage(sendCtx, msg.Chat.ID, part, replyTo); err != nil {
+		// Claude writes Markdown; Telegram renders HTML. Convert, and fall
+		// back to the raw text on any 400 — bad entities, or a message the
+		// added tags/escapes pushed over the length limit.
+		err := b.send(sendCtx, msg.Chat.ID, mdToHTML(part), "HTML", replyTo)
+		if err != nil && strings.Contains(err.Error(), "status 400") {
+			err = b.send(sendCtx, msg.Chat.ID, part, "", replyTo)
+		}
+		if err != nil {
 			log.Printf("sendMessage (chat %d): %v", msg.Chat.ID, b.redact(err))
 			return
 		}
@@ -869,9 +936,11 @@ func (b *bot) askClaude(s *session, prompt string) (string, error) {
 	if b.cfg.model != "" {
 		args = append(args, "--model", b.cfg.model)
 	}
+	sysPrompt := telegramStylePrompt
 	if b.cfg.systemPrompt != "" {
-		args = append(args, "--append-system-prompt", b.cfg.systemPrompt)
+		sysPrompt += "\n\n" + b.cfg.systemPrompt
 	}
+	args = append(args, "--append-system-prompt", sysPrompt)
 
 	cmd := exec.CommandContext(runCtx, b.cfg.claudeBin, args...)
 	cmd.Dir = s.workDir
@@ -926,6 +995,77 @@ func (b *bot) noteFailure(s *session) {
 		s.started = false
 		s.failures = 0
 		log.Printf("session %s reset to %s after failed claude run", oldID, s.id)
+	}
+}
+
+// Inline Markdown patterns converted to Telegram HTML. They run on
+// HTML-escaped text, so the replacements cannot collide with user content.
+var (
+	reInlineCode = regexp.MustCompile("`([^`\n]+)`")
+	reBold       = regexp.MustCompile(`\*\*([^*\n]+?)\*\*`)
+	reStrike     = regexp.MustCompile(`~~([^~\n]+?)~~`)
+	// The URL part tolerates one level of parentheses (Wikipedia-style).
+	reLink    = regexp.MustCompile(`\[([^\]\n]+)\]\((https?://[^\s)]+(?:\([^\s)]*\)[^\s)]*)*)\)`)
+	reHeader  = regexp.MustCompile(`(?m)^#{1,6}[ \t]+(.+)$`)
+	reBullet  = regexp.MustCompile(`(?m)^([ \t]*)[-*][ \t]+`)
+	reLangTag = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+#.-]*$`)
+)
+
+// mdToHTML converts the small Markdown subset Claude is instructed to use
+// (telegramStylePrompt) into Telegram HTML: fenced code blocks, inline code,
+// bold, strikethrough, links, headers (rendered bold), and bullets.
+// Everything else is escaped and rendered literally.
+func mdToHTML(text string) string {
+	var sb strings.Builder
+	for i, seg := range strings.Split(text, "```") {
+		if i%2 == 1 {
+			// Fenced code block; drop the leading line only when it looks
+			// like a language tag, not a first line of code.
+			if nl := strings.IndexByte(seg, '\n'); nl >= 0 && reLangTag.MatchString(strings.TrimSpace(seg[:nl])) {
+				seg = seg[nl+1:]
+			}
+			sb.WriteString("<pre>")
+			sb.WriteString(html.EscapeString(strings.Trim(seg, "\n")))
+			sb.WriteString("</pre>")
+			continue
+		}
+		s := html.EscapeString(seg)
+		// Pull inline code out into placeholders first so the other
+		// patterns can't rewrite inside <code> spans (Telegram forbids
+		// entities nested in code). NUL can't occur in message text.
+		var codes []string
+		s = reInlineCode.ReplaceAllStringFunc(s, func(m string) string {
+			codes = append(codes, "<code>"+m[1:len(m)-1]+"</code>")
+			return fmt.Sprintf("\x00%d\x00", len(codes)-1)
+		})
+		s = reLink.ReplaceAllString(s, `<a href="$2">$1</a>`)
+		s = reBold.ReplaceAllString(s, "<b>$1</b>")
+		s = reStrike.ReplaceAllString(s, "<s>$1</s>")
+		s = reHeader.ReplaceAllString(s, "<b>$1</b>")
+		s = reBullet.ReplaceAllString(s, "$1• ")
+		for i, c := range codes {
+			s = strings.Replace(s, fmt.Sprintf("\x00%d\x00", i), c, 1)
+		}
+		sb.WriteString(s)
+	}
+	return sb.String()
+}
+
+// balanceFences repairs fenced code blocks that a chunk split cut in half:
+// a chunk that ends inside a block gets a closing fence, and the next chunk
+// reopens it, so each chunk converts to valid Telegram HTML on its own.
+func balanceFences(parts []string) {
+	inside := false
+	for i, p := range parts {
+		if inside {
+			p = "```\n" + p
+		}
+		endsInside := strings.Count(p, "```")%2 == 1
+		if endsInside {
+			p += "\n```"
+		}
+		parts[i] = p
+		inside = endsInside
 	}
 }
 
@@ -991,10 +1131,13 @@ func (b *bot) getUpdates(offset int64) ([]tgUpdate, error) {
 	return updates, err
 }
 
-func (b *bot) sendMessage(ctx context.Context, chatID int64, text string, replyTo int64) error {
+func (b *bot) send(ctx context.Context, chatID int64, text, parseMode string, replyTo int64) error {
 	params := map[string]any{
 		"chat_id": chatID,
 		"text":    text,
+	}
+	if parseMode != "" {
+		params["parse_mode"] = parseMode
 	}
 	if replyTo != 0 {
 		params["reply_to_message_id"] = replyTo
