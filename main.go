@@ -27,6 +27,13 @@ const (
 	// maxTokens caps the length (and cost) of a single Claude reply.
 	maxTokens = 4096
 
+	// webSearchToolType is the server-side web search tool. This variant
+	// requires a recent model; use "web_search_20250305" for older ones.
+	webSearchToolType = "web_search_20260209"
+
+	// webSearchMaxUses bounds searches (and their cost) per message.
+	webSearchMaxUses = 3
+
 	// telegramMsgLimit is Telegram's maximum message length. We split a bit
 	// below it to leave margin for how Telegram counts characters.
 	telegramMsgLimit = 4000
@@ -110,25 +117,52 @@ type claudeRequest struct {
 	Model     string          `json:"model"`
 	MaxTokens int             `json:"max_tokens"`
 	System    string          `json:"system,omitempty"`
+	Tools     []claudeTool    `json:"tools,omitempty"`
 	Messages  []claudeMessage `json:"messages"`
 }
 
-type claudeMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+type claudeTool struct {
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	MaxUses int    `json:"max_uses,omitempty"`
 }
 
+// claudeMessage.Content is either a plain string (our prompt) or raw content
+// blocks echoed back from a response when continuing a pause_turn.
+type claudeMessage struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"`
+}
+
+// Content is kept raw: we extract the text blocks from it for the reply, and
+// echo it back verbatim when the server pauses its tool loop (pause_turn).
 type claudeResponse struct {
-	Type    string `json:"type"`
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	StopReason string `json:"stop_reason"`
+	Type       string          `json:"type"`
+	Content    json.RawMessage `json:"content"`
+	StopReason string          `json:"stop_reason"`
 	Error      *struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// text concatenates the text blocks of the response content, skipping tool
+// use and search result blocks.
+func (cr *claudeResponse) text() string {
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(cr.Content, &blocks); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, b := range blocks {
+		if b.Type == "text" {
+			sb.WriteString(b.Text)
+		}
+	}
+	return strings.TrimSpace(sb.String())
 }
 
 type bot struct {
@@ -303,17 +337,45 @@ func (b *bot) typeWhile(ctx context.Context, chatID int64) (stop func()) {
 	return func() { close(done) }
 }
 
-// askClaude calls the Anthropic Messages API. 429 and 5xx responses are
-// retried with exponential backoff; other errors are returned immediately.
+// askClaude calls the Anthropic Messages API with the server-side web search
+// tool enabled. When the server pauses its tool loop (stop_reason
+// "pause_turn"), the assistant content is echoed back so it can resume, a
+// bounded number of times.
 func (b *bot) askClaude(ctx context.Context, prompt string) (string, error) {
+	messages := []claudeMessage{{Role: "user", Content: prompt}}
+	const maxContinuations = 4
+	for i := 0; ; i++ {
+		cr, err := b.doClaudeRequest(ctx, messages)
+		if err != nil {
+			return "", err
+		}
+		if cr.StopReason == "pause_turn" && i < maxContinuations {
+			messages = append(messages, claudeMessage{Role: "assistant", Content: cr.Content})
+			continue
+		}
+		text := cr.text()
+		if text == "" {
+			return "", fmt.Errorf("empty response (stop_reason %q)", cr.StopReason)
+		}
+		return text, nil
+	}
+}
+
+// doClaudeRequest performs one Messages API request. 429 and 5xx responses
+// are retried with exponential backoff; other errors are returned
+// immediately.
+func (b *bot) doClaudeRequest(ctx context.Context, messages []claudeMessage) (*claudeResponse, error) {
 	body, err := json.Marshal(claudeRequest{
 		Model:     b.cfg.model,
 		MaxTokens: maxTokens,
 		System:    b.cfg.systemPrompt,
-		Messages:  []claudeMessage{{Role: "user", Content: prompt}},
+		Tools: []claudeTool{
+			{Type: webSearchToolType, Name: "web_search", MaxUses: webSearchMaxUses},
+		},
+		Messages: messages,
 	})
 	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
+		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
 	const attempts = 3
@@ -323,13 +385,13 @@ func (b *bot) askClaude(ctx context.Context, prompt string) (string, error) {
 			select {
 			case <-time.After(time.Duration(1<<attempt) * time.Second):
 			case <-ctx.Done():
-				return "", ctx.Err()
+				return nil, ctx.Err()
 			}
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicURL, bytes.NewReader(body))
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("x-api-key", b.cfg.anthropicKey)
@@ -353,7 +415,7 @@ func (b *bot) askClaude(ctx context.Context, prompt string) (string, error) {
 				select {
 				case <-time.After(wait):
 				case <-ctx.Done():
-					return "", ctx.Err()
+					return nil, ctx.Err()
 				}
 			}
 			continue
@@ -361,28 +423,17 @@ func (b *bot) askClaude(ctx context.Context, prompt string) (string, error) {
 
 		var cr claudeResponse
 		if err := json.Unmarshal(respBody, &cr); err != nil {
-			return "", fmt.Errorf("anthropic API status %d: unparseable response: %w", resp.StatusCode, err)
+			return nil, fmt.Errorf("anthropic API status %d: unparseable response: %w", resp.StatusCode, err)
 		}
 		if resp.StatusCode != http.StatusOK {
 			if cr.Error != nil {
-				return "", fmt.Errorf("anthropic API status %d: %s: %s", resp.StatusCode, cr.Error.Type, cr.Error.Message)
+				return nil, fmt.Errorf("anthropic API status %d: %s: %s", resp.StatusCode, cr.Error.Type, cr.Error.Message)
 			}
-			return "", fmt.Errorf("anthropic API status %d", resp.StatusCode)
+			return nil, fmt.Errorf("anthropic API status %d", resp.StatusCode)
 		}
-
-		var sb strings.Builder
-		for _, block := range cr.Content {
-			if block.Type == "text" {
-				sb.WriteString(block.Text)
-			}
-		}
-		text := strings.TrimSpace(sb.String())
-		if text == "" {
-			return "", fmt.Errorf("empty response (stop_reason %q)", cr.StopReason)
-		}
-		return text, nil
+		return &cr, nil
 	}
-	return "", fmt.Errorf("after %d attempts: %w", attempts, lastErr)
+	return nil, fmt.Errorf("after %d attempts: %w", attempts, lastErr)
 }
 
 func retryAfter(header string) time.Duration {

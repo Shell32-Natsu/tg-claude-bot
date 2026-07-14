@@ -17,6 +17,9 @@ A Telegram bot that answers messages using the Anthropic Claude API. Single
 - Splits replies longer than Telegram's 4096-character limit into multiple
   messages.
 - Ignores messages from other bots.
+- Has Anthropic's server-side **web search** tool enabled (up to 3 searches
+  per message), so the model can verify facts instead of guessing. Searches
+  are billed per use by Anthropic.
 
 ## Configuration
 
@@ -43,8 +46,11 @@ that don't mention it (needed for the reply-to-bot trigger).
 
 ```sh
 cp .env.example .env   # fill in your tokens
-docker compose up -d --build
+docker compose up -d   # pulls ghcr.io/shell32-natsu/tg-claude-bot:main
 ```
+
+To build the image locally instead, uncomment `build: .` in
+`docker-compose.yml` and run `docker compose up -d --build`.
 
 The container runs as a non-root user on a distroless base image, with a
 read-only filesystem and no exposed ports.

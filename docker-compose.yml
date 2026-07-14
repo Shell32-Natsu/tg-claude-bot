@@ -1,7 +1,10 @@
 services:
   bot:
-    build: .
-    image: tg-claude-bot
+    # Image published by .github/workflows/docker.yml on pushes to main.
+    image: ghcr.io/shell32-natsu/tg-claude-bot:main
+    # To build locally instead, uncomment the next line and run
+    # `docker compose up -d --build`.
+    # build: .
     env_file: .env
     restart: unless-stopped
     read_only: true
