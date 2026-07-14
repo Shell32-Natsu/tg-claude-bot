@@ -1,7 +1,9 @@
 # tg-claude-bot
 
-A Telegram bot that answers messages using the Anthropic Claude API. Single
-`main.go`, Go standard library only.
+A Telegram bot that answers messages by driving the **Claude Code CLI**,
+authenticated with a Claude **Max/Pro subscription** (OAuth) — no API key
+needed. Single `main.go`, Go standard library only (plus the `claude`
+binary at runtime).
 
 ## Behavior
 
@@ -11,30 +13,46 @@ A Telegram bot that answers messages using the Anthropic Claude API. Single
 - **Group chats:** replies only when the bot is `@mentioned` (the mention is
   detected via Telegram message entities and stripped before the text is sent
   to Claude) or when someone replies to one of the bot's own messages.
-- Every message is answered independently — the bot keeps **no conversation
-  memory**.
+- **One Claude Code session per chat**, so conversations have memory. In
+  groups, each message is labeled with the sender's name so Claude can tell
+  participants apart in the shared session.
+- Sessions **idle for more than 1 hour are cleaned up** (session forgotten and
+  its transcript deleted); the next message starts a fresh conversation.
+- Even a chat that never goes idle gets a **fresh session once a week**, so
+  context doesn't accumulate forever.
+- Claude's tool access is restricted to **web search** only (which runs
+  server-side at Anthropic) — no shell, no file access, no URL fetching from
+  the bot's network, no MCP servers — since chat messages are untrusted
+  input.
+- Each session runs in its own **empty temporary directory** (under the OS
+  temp dir), deleted when the session expires and cleared on bot restart.
 - Shows a "typing…" chat action while waiting for Claude.
 - Splits replies longer than Telegram's 4096-character limit into multiple
-  messages.
+  messages (capped at 4 messages per answer to prevent chat flooding).
 - Ignores messages from other bots.
-- Has Anthropic's server-side **web search** tool enabled (up to 3 searches
-  per message), so the model can verify facts instead of guessing. Searches
-  are billed per use by Anthropic.
+- Verifies Claude Code authentication at startup (`claude auth status`) and
+  exits with a clear error instead of failing message-by-message.
 
 ## Configuration
 
 Environment variables (see `.env.example`):
 
-| Variable             | Required | Default           | Description                          |
-| -------------------- | -------- | ----------------- | ------------------------------------ |
-| `TELEGRAM_BOT_TOKEN` | yes      | —                 | Bot token from @BotFather            |
-| `ANTHROPIC_API_KEY`  | yes      | —                 | Anthropic API key                    |
-| `CLAUDE_MODEL`       | no       | `claude-sonnet-5` | Claude model ID                      |
-| `SYSTEM_PROMPT`      | no       | (empty)           | System prompt for every request      |
+| Variable                  | Required   | Default  | Description                                            |
+| ------------------------- | ---------- | -------- | ------------------------------------------------------ |
+| `TELEGRAM_BOT_TOKEN`      | yes        | —        | Bot token from @BotFather                              |
+| `CLAUDE_CODE_OAUTH_TOKEN` | in Docker  | —        | Subscription token from `claude setup-token`           |
+| `CLAUDE_MODEL`            | no         | (empty)  | Model alias (`sonnet`, `opus`) or full model ID        |
+| `SYSTEM_PROMPT`           | no         | (empty)  | Appended to Claude Code's default system prompt        |
+| `SESSION_IDLE_MINUTES`    | no         | `60`     | Drop a chat's session after this much inactivity       |
+| `SESSION_MAX_AGE_DAYS`    | no         | `7`      | Restart a chat's session (fresh context) after this    |
+| `TELEGRAM_API_BASE`       | no         | `https://api.telegram.org` | For self-hosted Bot API servers      |
+| `CLAUDE_BIN`              | no         | `claude` | Path to the Claude Code binary                         |
 
-> Note: verify that `CLAUDE_MODEL` is a model ID your Anthropic account can
-> use (`GET /v1/models`). If `claude-sonnet-5` returns a `not_found_error`,
-> set e.g. `CLAUDE_MODEL=claude-sonnet-4-6`.
+To get `CLAUDE_CODE_OAUTH_TOKEN`, run `claude setup-token` on any machine
+where Claude Code is logged in with your subscription account, and paste the
+resulting token into `.env`. When running the bot locally instead of in
+Docker, you can skip the token entirely if you have already run
+`claude login` — the CLI will use your stored credentials.
 
 For group mentions to work in all messages, either mention the bot explicitly
 or disable BotFather's *Group Privacy* mode so the bot can see group messages
@@ -52,15 +70,26 @@ docker compose up -d   # pulls ghcr.io/shell32-natsu/tg-claude-bot:main
 To build the image locally instead, uncomment `build: .` in
 `docker-compose.yml` and run `docker compose up -d --build`.
 
-The container runs as a non-root user on a distroless base image, with a
-read-only filesystem and no exposed ports.
+The container runs as a non-root user with a read-only root filesystem and no
+exposed ports; the only writable paths are `/home/node` (a named volume for
+Claude Code's session state) and a tmpfs `/tmp`.
 
 ### Locally
 
+Requires the [Claude Code CLI](https://code.claude.com/docs) on `PATH`,
+logged in via `claude login` (or `CLAUDE_CODE_OAUTH_TOKEN` set):
+
 ```sh
-export TELEGRAM_BOT_TOKEN=... ANTHROPIC_API_KEY=...
+export TELEGRAM_BOT_TOKEN=...
 go run .
 ```
+
+## Notes
+
+- Session transcripts live under `~/.claude/projects/`; the bot deletes a
+  session's transcript when it expires it after an hour of inactivity.
+- `ANTHROPIC_API_KEY` is deliberately stripped from the CLI's environment so
+  replies always bill to the subscription, never to an API key.
 
 ## CI
 

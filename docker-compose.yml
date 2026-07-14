@@ -7,7 +7,19 @@ services:
     # build: .
     env_file: .env
     restart: unless-stopped
+    # The bot runs as PID 1 and spawns claude processes; init reaps any
+    # children orphaned when a timed-out claude run is killed.
+    init: true
     read_only: true
     security_opt:
       - no-new-privileges:true
+    # Claude Code needs a writable home for session state (~/.claude) and a
+    # writable /tmp; everything else stays read-only.
+    volumes:
+      - claude-home:/home/node
+    tmpfs:
+      - /tmp
     # Long-polling only — no ports exposed; outbound HTTPS is all it needs.
+
+volumes:
+  claude-home:

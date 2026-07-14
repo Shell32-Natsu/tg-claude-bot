@@ -1,11 +1,18 @@
-// Command tg-claude-bot is a Telegram bot that answers messages using the
-// Anthropic Claude API. It uses long-polling (getUpdates), so it works behind
-// NAT without a public IP, and it depends only on the Go standard library.
+// Command tg-claude-bot is a Telegram bot that answers messages by driving
+// the Claude Code CLI in print mode, authenticated with a Claude subscription
+// (OAuth) instead of an API key. It uses long-polling (getUpdates), so it
+// works behind NAT without a public IP, and it depends only on the Go
+// standard library plus the `claude` binary.
+//
+// Each chat (group or private) gets its own persistent Claude Code session,
+// so conversations have memory. Sessions idle for more than an hour are
+// expired and their transcripts deleted; the next message starts fresh.
 package main
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,62 +20,107 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 )
 
 const (
-	anthropicURL     = "https://api.anthropic.com/v1/messages"
-	anthropicVersion = "2023-06-01"
-	defaultModel     = "claude-sonnet-5"
-
-	// maxTokens caps the length (and cost) of a single Claude reply.
-	maxTokens = 4096
-
-	// webSearchToolType is the server-side web search tool. This variant
-	// requires a recent model; use "web_search_20250305" for older ones.
-	webSearchToolType = "web_search_20260209"
-
-	// webSearchMaxUses bounds searches (and their cost) per message.
-	webSearchMaxUses = 3
-
 	// telegramMsgLimit is Telegram's maximum message length. We split a bit
 	// below it to leave margin for how Telegram counts characters.
 	telegramMsgLimit = 4000
 
+	// maxReplyParts caps how many Telegram messages one answer may span, so
+	// a prompt that coaxes Claude into a huge dump can't flood the chat.
+	maxReplyParts = 4
+
 	// pollTimeout is the getUpdates long-poll duration in seconds.
 	pollTimeout = 50
 
-	// maxConcurrent bounds the number of messages handled simultaneously.
-	maxConcurrent = 8
+	// maxConcurrent bounds the number of claude processes running at once.
+	// Each one is a full Claude Code instance, so keep this modest.
+	maxConcurrent = 4
+
+	// defaultIdleTimeout is how long a chat's session may sit unused before
+	// the janitor expires it and deletes its transcript (override with
+	// SESSION_IDLE_MINUTES).
+	defaultIdleTimeout = time.Hour
+
+	// defaultMaxAge caps a session's total lifetime: even a chat that never
+	// goes idle starts a fresh session (no previous context) once a week
+	// (override with SESSION_MAX_AGE_DAYS).
+	defaultMaxAge = 7 * 24 * time.Hour
+
+	// claudeTimeout bounds one claude CLI invocation (a single reply,
+	// possibly including web searches).
+	claudeTimeout = 5 * time.Minute
+
+	// claudeTools is the only tool surface exposed to the model. Telegram
+	// messages are untrusted input, so no Bash, no file tools, no MCP —
+	// and no WebFetch, which would fetch attacker-chosen URLs from inside
+	// our network (SSRF); WebSearch runs server-side at Anthropic.
+	claudeTools = "WebSearch"
 )
 
 type config struct {
 	telegramToken string
-	anthropicKey  string
-	model         string
+	apiBase       string // Telegram Bot API base URL, for self-hosted Bot API servers
+	oauthToken    string // CLAUDE_CODE_OAUTH_TOKEN; may be empty if `claude` is already logged in
+	model         string // optional --model value (alias like "sonnet" or a full model ID)
 	systemPrompt  string
+	claudeBin     string
+	idleTimeout   time.Duration
+	maxAge        time.Duration
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
 		telegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
-		anthropicKey:  os.Getenv("ANTHROPIC_API_KEY"),
+		apiBase:       os.Getenv("TELEGRAM_API_BASE"),
+		oauthToken:    os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"),
 		model:         os.Getenv("CLAUDE_MODEL"),
 		systemPrompt:  os.Getenv("SYSTEM_PROMPT"),
+		claudeBin:     os.Getenv("CLAUDE_BIN"),
+		idleTimeout:   defaultIdleTimeout,
+		maxAge:        defaultMaxAge,
 	}
 	if cfg.telegramToken == "" {
 		return cfg, errors.New("TELEGRAM_BOT_TOKEN is required")
 	}
-	if cfg.anthropicKey == "" {
-		return cfg, errors.New("ANTHROPIC_API_KEY is required")
+	if cfg.apiBase == "" {
+		cfg.apiBase = "https://api.telegram.org"
 	}
-	if cfg.model == "" {
-		cfg.model = defaultModel
+	cfg.apiBase = strings.TrimSuffix(cfg.apiBase, "/")
+	if cfg.claudeBin == "" {
+		cfg.claudeBin = "claude"
+	}
+	if err := envDuration("SESSION_IDLE_MINUTES", time.Minute, &cfg.idleTimeout); err != nil {
+		return cfg, err
+	}
+	if err := envDuration("SESSION_MAX_AGE_DAYS", 24*time.Hour, &cfg.maxAge); err != nil {
+		return cfg, err
 	}
 	return cfg, nil
+}
+
+// envDuration overwrites *dst with the named env var (a positive integer)
+// times unit, leaving *dst untouched when the variable is unset.
+func envDuration(name string, unit time.Duration, dst *time.Duration) error {
+	v := os.Getenv(name)
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fmt.Errorf("%s must be a positive integer, got %q", name, v)
+	}
+	*dst = time.Duration(n) * unit
+	return nil
 }
 
 // Telegram API types (only the fields this bot needs).
@@ -94,9 +146,10 @@ type tgMessage struct {
 }
 
 type tgUser struct {
-	ID       int64  `json:"id"`
-	IsBot    bool   `json:"is_bot"`
-	Username string `json:"username"`
+	ID        int64  `json:"id"`
+	IsBot     bool   `json:"is_bot"`
+	Username  string `json:"username"`
+	FirstName string `json:"first_name"`
 }
 
 type tgChat struct {
@@ -111,69 +164,162 @@ type tgEntity struct {
 	User   *tgUser `json:"user"`
 }
 
-// Anthropic API types.
-
-type claudeRequest struct {
-	Model     string          `json:"model"`
-	MaxTokens int             `json:"max_tokens"`
-	System    string          `json:"system,omitempty"`
-	Tools     []claudeTool    `json:"tools,omitempty"`
-	Messages  []claudeMessage `json:"messages"`
+// session is one chat's Claude Code session. Its mutex serializes claude
+// invocations for the chat (concurrent --resume of one session would race)
+// and guards the other fields.
+type session struct {
+	mu       sync.Mutex
+	id       string // session UUID passed to --session-id / --resume
+	workDir  string // empty per-session temp dir claude runs in; removed on expiry
+	started  bool   // true once a claude run has succeeded, i.e. --resume is valid
+	expired  bool   // removed from the map; holders must discard and re-acquire
+	failures int    // consecutive failed claude runs; the session resets after two
+	created  time.Time
+	lastUsed time.Time
 }
 
-type claudeTool struct {
-	Type    string `json:"type"`
-	Name    string `json:"name"`
-	MaxUses int    `json:"max_uses,omitempty"`
+// sessionManager maps chat IDs to live sessions.
+type sessionManager struct {
+	mu          sync.Mutex
+	sessions    map[int64]*session
+	idleTimeout time.Duration
+	maxAge      time.Duration
+
+	// cleanup is called (in its own goroutine) with each expired session
+	// after it has been removed from the map, to delete its on-disk state.
+	cleanup func(*session)
 }
 
-// claudeMessage.Content is either a plain string (our prompt) or raw content
-// blocks echoed back from a response when continuing a pause_turn.
-type claudeMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
-}
-
-// Content is kept raw: we extract the text blocks from it for the reply, and
-// echo it back verbatim when the server pauses its tool loop (pause_turn).
-type claudeResponse struct {
-	Type       string          `json:"type"`
-	Content    json.RawMessage `json:"content"`
-	StopReason string          `json:"stop_reason"`
-	Error      *struct {
-		Type    string `json:"type"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
-// text concatenates the text blocks of the response content, skipping tool
-// use and search result blocks.
-func (cr *claudeResponse) text() string {
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+func newSessionManager(idleTimeout, maxAge time.Duration) *sessionManager {
+	return &sessionManager{
+		sessions:    make(map[int64]*session),
+		idleTimeout: idleTimeout,
+		maxAge:      maxAge,
 	}
-	if err := json.Unmarshal(cr.Content, &blocks); err != nil {
-		return ""
+}
+
+// staleReason reports why the session should be expired, or "" if it is
+// still fresh. The caller must hold s.mu.
+func (sm *sessionManager) staleReason(s *session) string {
+	switch {
+	case time.Since(s.lastUsed) > sm.idleTimeout:
+		return fmt.Sprintf("idle > %v", sm.idleTimeout)
+	case time.Since(s.created) > sm.maxAge:
+		return fmt.Sprintf("age > %v", sm.maxAge)
 	}
-	var sb strings.Builder
-	for _, b := range blocks {
-		if b.Type == "text" {
-			sb.WriteString(b.Text)
+	return ""
+}
+
+// expire marks the session expired, removes it from the map, and schedules
+// its disk cleanup. The caller must hold s.mu.
+func (sm *sessionManager) expire(chatID int64, s *session, reason string) {
+	s.expired = true
+	sm.mu.Lock()
+	if sm.sessions[chatID] == s {
+		delete(sm.sessions, chatID)
+	}
+	sm.mu.Unlock()
+	log.Printf("session %s expired for chat %d (%s)", s.id, chatID, reason)
+	if sm.cleanup != nil {
+		go sm.cleanup(s)
+	}
+}
+
+// acquire returns the chat's session with its mutex held, creating a new one
+// if none exists or the mapped one is expired or stale. Checking staleness
+// here (not just in the janitor) guarantees a chat busy enough to dodge every
+// janitor sweep still rotates once it exceeds the max age. The caller must
+// call release when done.
+func (sm *sessionManager) acquire(chatID int64) *session {
+	for {
+		sm.mu.Lock()
+		s := sm.sessions[chatID]
+		if s == nil {
+			now := time.Now()
+			s = &session{id: newUUID(), created: now, lastUsed: now}
+			sm.sessions[chatID] = s
+			log.Printf("session %s created for chat %d", s.id, chatID)
 		}
+		sm.mu.Unlock()
+
+		s.mu.Lock()
+		if s.expired {
+			s.mu.Unlock()
+			continue
+		}
+		if reason := sm.staleReason(s); reason != "" {
+			sm.expire(chatID, s, reason)
+			s.mu.Unlock()
+			continue
+		}
+		return s
 	}
-	return strings.TrimSpace(sb.String())
+}
+
+func (sm *sessionManager) release(s *session) {
+	s.lastUsed = time.Now()
+	s.mu.Unlock()
+}
+
+// expireStale expires sessions that are past the idle timeout or max age.
+// Sessions currently mid-conversation hold their mutex and are skipped via
+// TryLock until the next sweep (or until acquire catches them).
+func (sm *sessionManager) expireStale() {
+	sm.mu.Lock()
+	candidates := make(map[int64]*session, len(sm.sessions))
+	for chatID, s := range sm.sessions {
+		candidates[chatID] = s
+	}
+	sm.mu.Unlock()
+
+	for chatID, s := range candidates {
+		if !s.mu.TryLock() {
+			continue
+		}
+		if !s.expired {
+			if reason := sm.staleReason(s); reason != "" {
+				sm.expire(chatID, s, reason)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// newUUID returns a random RFC 4122 v4 UUID; claude --session-id requires
+// this format.
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failing is unrecoverable and can't produce a usable ID.
+		log.Fatalf("crypto/rand: %v", err)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 type bot struct {
 	cfg         config
 	botID       int64
 	botUsername string
+	workBase    string
+	sessions    *sessionManager
+
+	// claudeEnv is the child environment for claude runs, with
+	// ANTHROPIC_API_KEY dropped so replies always use subscription auth.
+	claudeEnv []string
+
+	// sem bounds concurrent claude processes. It is taken only around the
+	// claude run itself, never while waiting for a chat's session mutex, so
+	// a burst of messages in one chat can't starve every other chat.
+	sem chan struct{}
+
+	// redactor strips secrets from anything we log.
+	redactor *strings.Replacer
 
 	// tgClient's timeout must exceed pollTimeout or long polls would be
 	// cancelled by our own client.
-	tgClient     *http.Client
-	claudeClient *http.Client
+	tgClient *http.Client
 }
 
 func main() {
@@ -183,12 +329,43 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	if _, err := exec.LookPath(cfg.claudeBin); err != nil {
+		log.Fatalf("claude CLI not found (%v); install it and either run `claude login` or set CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`", err)
+	}
+	if cfg.oauthToken == "" {
+		log.Printf("CLAUDE_CODE_OAUTH_TOKEN not set; relying on existing `claude` login state")
+	}
+
+	// Each session gets its own empty temp directory under workBase as
+	// claude's cwd. Sessions don't survive a restart, so leftovers from a
+	// previous run are cleared on startup.
+	workBase := filepath.Join(os.TempDir(), "tg-claude-bot")
+	if err := os.RemoveAll(workBase); err != nil {
+		log.Fatalf("workdir: %v", err)
+	}
+	if err := os.MkdirAll(workBase, 0o700); err != nil {
+		log.Fatalf("workdir: %v", err)
+	}
+
+	redactPairs := []string{cfg.telegramToken, "[REDACTED]"}
+	if cfg.oauthToken != "" {
+		redactPairs = append(redactPairs, cfg.oauthToken, "[REDACTED]")
+	}
 
 	b := &bot{
-		cfg:          cfg,
-		tgClient:     &http.Client{Timeout: (pollTimeout + 20) * time.Second},
-		claudeClient: &http.Client{Timeout: 3 * time.Minute},
+		cfg:      cfg,
+		workBase: workBase,
+		sessions: newSessionManager(cfg.idleTimeout, cfg.maxAge),
+		claudeEnv: slices.DeleteFunc(os.Environ(), func(kv string) bool {
+			return strings.HasPrefix(kv, "ANTHROPIC_API_KEY=")
+		}),
+		sem:      make(chan struct{}, maxConcurrent),
+		redactor: strings.NewReplacer(redactPairs...),
+		tgClient: &http.Client{Timeout: (pollTimeout + 20) * time.Second},
 	}
+	b.sessions.cleanup = b.cleanupSession
+	b.checkClaudeAuth()
+	b.cleanupOrphanedProjects()
 
 	me, err := b.getMe()
 	if err != nil {
@@ -196,16 +373,119 @@ func main() {
 	}
 	b.botID = me.ID
 	b.botUsername = me.Username
-	log.Printf("started as @%s (model %s)", b.botUsername, cfg.model)
+	log.Printf("started as @%s (model %q, session idle timeout %v, max age %v)", b.botUsername, cfg.model, cfg.idleTimeout, cfg.maxAge)
 
+	go b.janitorLoop()
 	b.pollLoop()
+}
+
+// janitorLoop periodically expires stale sessions (disk cleanup happens via
+// the session manager's cleanup callback). The check interval scales with
+// the idle timeout so short timeouts still expire promptly.
+func (b *bot) janitorLoop() {
+	interval := max(min(b.cfg.idleTimeout/4, time.Minute), 10*time.Second)
+	for range time.Tick(interval) {
+		b.sessions.expireStale()
+	}
+}
+
+// cleanupSession removes an expired session's on-disk state: its transcript
+// and its temp working directory.
+func (b *bot) cleanupSession(s *session) {
+	b.deleteTranscripts(s.id)
+	if s.workDir != "" {
+		if err := os.RemoveAll(s.workDir); err != nil {
+			log.Printf("delete workdir %s: %v", s.workDir, err)
+		}
+	}
+}
+
+// checkClaudeAuth fails fast at startup when claude has no working
+// credentials, instead of surfacing auth errors one user message at a time.
+func (b *bot) checkClaudeAuth() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, b.cfg.claudeBin, "auth", "status", "--json")
+	cmd.Env = b.claudeEnv
+	out, err := cmd.Output()
+	if err != nil {
+		// Older CLIs may lack the subcommand; don't block startup on that.
+		log.Printf("claude auth status check skipped: %v", b.redact(err))
+		return
+	}
+	var st struct {
+		LoggedIn bool `json:"loggedIn"`
+	}
+	if err := json.Unmarshal(out, &st); err != nil {
+		log.Printf("claude auth status check skipped: unparseable output")
+		return
+	}
+	if !st.LoggedIn {
+		log.Fatalf("claude is not logged in: run `claude login`, or set CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`")
+	}
+}
+
+// cleanupOrphanedProjects removes transcript project dirs left behind by a
+// previous run. Sessions don't survive a restart, so every project dir
+// derived from a per-session workdir (…/tg-claude-bot/chat-*) is an orphan.
+func (b *bot) cleanupOrphanedProjects() {
+	matches, err := filepath.Glob(filepath.Join(claudeConfigDir(), "projects", "*tg-claude-bot-chat-*"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		if err := os.RemoveAll(m); err != nil {
+			log.Printf("delete orphaned project dir %s: %v", m, err)
+		}
+	}
+	if len(matches) > 0 {
+		log.Printf("removed %d orphaned session project dir(s)", len(matches))
+	}
+}
+
+func claudeConfigDir() string {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".claude")
+}
+
+// deleteTranscripts removes the session's transcript files under the claude
+// config dir so expired conversations don't accumulate on disk. The ID is
+// generated by this bot (never user input), so the glob is safe.
+func (b *bot) deleteTranscripts(sessionID string) {
+	configDir := claudeConfigDir()
+	if configDir == "" {
+		return
+	}
+	matches, err := filepath.Glob(filepath.Join(configDir, "projects", "*", sessionID+".jsonl"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		if err := os.Remove(m); err != nil {
+			log.Printf("delete transcript %s: %v", m, err)
+			continue
+		}
+		// The per-session cwd gives each session its own project dir; once
+		// it holds no other transcripts, remove it (and side files like
+		// memory/) entirely.
+		dir := filepath.Dir(m)
+		if left, err := filepath.Glob(filepath.Join(dir, "*.jsonl")); err == nil && len(left) == 0 {
+			_ = os.RemoveAll(dir)
+		}
+	}
 }
 
 // pollLoop fetches updates forever and dispatches each eligible message to a
 // worker goroutine. It is the only writer of the offset, so there is no race
-// on it; concurrency is bounded by the semaphore channel.
+// on it. Claude concurrency is bounded inside handleMessage (b.sem), not
+// here, so the poll loop never stalls behind a busy chat.
 func (b *bot) pollLoop() {
-	sem := make(chan struct{}, maxConcurrent)
 	var offset int64
 
 	for {
@@ -227,11 +507,7 @@ func (b *bot) pollLoop() {
 			if !ok || strings.TrimSpace(prompt) == "" {
 				continue
 			}
-			sem <- struct{}{}
-			go func(m *tgMessage, prompt string) {
-				defer func() { <-sem }()
-				b.handleMessage(m, prompt)
-			}(msg, prompt)
+			go b.handleMessage(msg, prompt)
 		}
 	}
 }
@@ -239,20 +515,35 @@ func (b *bot) pollLoop() {
 // promptFor decides whether the bot should answer msg and returns the text to
 // send to Claude. Private chats always get a reply. In groups the bot replies
 // only when @mentioned (mention stripped from the prompt) or when the message
-// is a reply to one of the bot's own messages.
+// is a reply to one of the bot's own messages. Group prompts are prefixed
+// with the sender's name so the shared session can tell speakers apart.
 func (b *bot) promptFor(msg *tgMessage) (string, bool) {
 	switch msg.Chat.Type {
 	case "private":
 		return msg.Text, true
 	case "group", "supergroup":
 		if prompt, ok := b.stripMention(msg.Text, msg.Entities); ok {
-			return prompt, true
+			return groupPrompt(msg.From, prompt), true
 		}
 		if r := msg.ReplyToMessage; r != nil && r.From != nil && r.From.ID == b.botID {
-			return msg.Text, true
+			return groupPrompt(msg.From, msg.Text), true
 		}
 	}
 	return "", false
+}
+
+// groupPrompt labels a group message with its sender. The label is plain
+// data inside the prompt; Claude uses it to distinguish participants in the
+// shared per-group session.
+func groupPrompt(from *tgUser, text string) string {
+	name := from.FirstName
+	if from.Username != "" {
+		name = "@" + from.Username
+	}
+	if name == "" {
+		return text
+	}
+	return fmt.Sprintf("[%s] %s", name, text)
 }
 
 // stripMention looks for a mention of the bot among the message entities and,
@@ -283,29 +574,46 @@ func (b *bot) stripMention(text string, entities []tgEntity) (string, bool) {
 	return "", false
 }
 
-// handleMessage asks Claude for an answer and sends it back, showing a
-// "typing" chat action while waiting.
+// handleMessage asks the chat's Claude Code session for an answer and sends
+// it back, showing a "typing" chat action while waiting. Waiting for the
+// chat's session mutex and for a claude slot has no deadline — the claude
+// run itself is bounded inside askClaude, and reply delivery gets its own
+// context so a slow turn can't eat the send budget.
 func (b *bot) handleMessage(msg *tgMessage, prompt string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
-	defer cancel()
+	typingCtx, stopTypingCtx := context.WithCancel(context.Background())
+	stopTyping := b.typeWhile(typingCtx, msg.Chat.ID)
 
-	stopTyping := b.typeWhile(ctx, msg.Chat.ID)
-	answer, err := b.askClaude(ctx, prompt)
+	s := b.sessions.acquire(msg.Chat.ID)
+	b.sem <- struct{}{}
+	answer, err := b.askClaude(s, prompt)
+	<-b.sem
+	b.sessions.release(s)
+
 	stopTyping()
+	stopTypingCtx()
 
 	if err != nil {
 		log.Printf("claude (chat %d): %v", msg.Chat.ID, b.redact(err))
 		answer = "Sorry, I couldn't process that message right now. Please try again later."
 	}
 
-	for i, part := range splitMessage(answer, telegramMsgLimit) {
+	parts := splitMessage(answer, telegramMsgLimit)
+	if len(parts) > maxReplyParts {
+		log.Printf("reply for chat %d truncated from %d to %d parts", msg.Chat.ID, len(parts), maxReplyParts)
+		parts = parts[:maxReplyParts]
+		parts[maxReplyParts-1] += "\n[reply truncated]"
+	}
+
+	sendCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	for i, part := range parts {
 		// Reply to the original message with the first chunk so the answer is
 		// attributable in group chats; follow-up chunks are sent plain.
 		var replyTo int64
 		if i == 0 {
 			replyTo = msg.MessageID
 		}
-		if err := b.sendMessage(ctx, msg.Chat.ID, part, replyTo); err != nil {
+		if err := b.sendMessage(sendCtx, msg.Chat.ID, part, replyTo); err != nil {
 			log.Printf("sendMessage (chat %d): %v", msg.Chat.ID, b.redact(err))
 			return
 		}
@@ -337,111 +645,94 @@ func (b *bot) typeWhile(ctx context.Context, chatID int64) (stop func()) {
 	return func() { close(done) }
 }
 
-// askClaude calls the Anthropic Messages API with the server-side web search
-// tool enabled. When the server pauses its tool loop (stop_reason
-// "pause_turn"), the assistant content is echoed back so it can resume, a
-// bounded number of times.
-func (b *bot) askClaude(ctx context.Context, prompt string) (string, error) {
-	messages := []claudeMessage{{Role: "user", Content: prompt}}
-	const maxContinuations = 4
-	for i := 0; ; i++ {
-		cr, err := b.doClaudeRequest(ctx, messages)
+// askClaude runs one turn of the chat's Claude Code session. The caller must
+// hold s.mu (acquire does this). The prompt is passed on stdin so message
+// text can never be parsed as CLI flags.
+func (b *bot) askClaude(s *session, prompt string) (string, error) {
+	runCtx, cancel := context.WithTimeout(context.Background(), claudeTimeout)
+	defer cancel()
+
+	if s.workDir == "" {
+		dir, err := os.MkdirTemp(b.workBase, "chat-")
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("create session workdir: %w", err)
 		}
-		if cr.StopReason == "pause_turn" && i < maxContinuations {
-			messages = append(messages, claudeMessage{Role: "assistant", Content: cr.Content})
-			continue
-		}
-		text := cr.text()
-		if text == "" {
-			return "", fmt.Errorf("empty response (stop_reason %q)", cr.StopReason)
-		}
-		return text, nil
+		s.workDir = dir
 	}
+
+	args := []string{
+		"-p",
+		"--output-format", "text",
+		"--tools", claudeTools,
+		"--allowedTools", claudeTools,
+		"--strict-mcp-config",
+	}
+	if s.started {
+		args = append(args, "--resume", s.id)
+	} else {
+		args = append(args, "--session-id", s.id)
+	}
+	if b.cfg.model != "" {
+		args = append(args, "--model", b.cfg.model)
+	}
+	if b.cfg.systemPrompt != "" {
+		args = append(args, "--append-system-prompt", b.cfg.systemPrompt)
+	}
+
+	cmd := exec.CommandContext(runCtx, b.cfg.claudeBin, args...)
+	cmd.Dir = s.workDir
+	cmd.Stdin = strings.NewReader(prompt)
+	cmd.Env = b.claudeEnv
+	// On timeout only the claude process is killed; if a child it spawned
+	// keeps our stdout pipe open, WaitDelay stops Run from hanging forever
+	// (which would wedge this chat's session mutex permanently).
+	cmd.WaitDelay = 15 * time.Second
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		b.noteFailure(s)
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = strings.TrimSpace(stdout.String())
+		}
+		// Redact before truncating: cutting first could slice a secret in
+		// half so the redactor no longer matches it.
+		detail = b.redactor.Replace(detail)
+		if r := []rune(detail); len(r) > 500 {
+			detail = string(r[:500]) + "…"
+		}
+		return "", fmt.Errorf("claude: %w: %s", err, detail)
+	}
+
+	// The run succeeded, so the session ID is registered with claude and
+	// --resume is what's valid from now on — even if the answer is empty.
+	s.started = true
+	s.failures = 0
+
+	answer := strings.TrimSpace(stdout.String())
+	if answer == "" {
+		return "", errors.New("claude: empty response")
+	}
+	return answer, nil
 }
 
-// doClaudeRequest performs one Messages API request. 429 and 5xx responses
-// are retried with exponential backoff; other errors are returned
-// immediately.
-func (b *bot) doClaudeRequest(ctx context.Context, messages []claudeMessage) (*claudeResponse, error) {
-	body, err := json.Marshal(claudeRequest{
-		Model:     b.cfg.model,
-		MaxTokens: maxTokens,
-		System:    b.cfg.systemPrompt,
-		Tools: []claudeTool{
-			{Type: webSearchToolType, Name: "web_search", MaxUses: webSearchMaxUses},
-		},
-		Messages: messages,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+// noteFailure records a failed claude run. A failed first run may still have
+// registered the session ID, and a session whose --resume fails repeatedly
+// (corrupt or missing transcript) would otherwise stay broken until it ages
+// out — in both cases start over with a fresh ID and no context.
+func (b *bot) noteFailure(s *session) {
+	s.failures++
+	if !s.started || s.failures >= 2 {
+		oldID := s.id
+		go b.deleteTranscripts(oldID)
+		s.id = newUUID()
+		s.started = false
+		s.failures = 0
+		log.Printf("session %s reset to %s after failed claude run", oldID, s.id)
 	}
-
-	const attempts = 3
-	var lastErr error
-	for attempt := 0; attempt < attempts; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-time.After(time.Duration(1<<attempt) * time.Second):
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicURL, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-api-key", b.cfg.anthropicKey)
-		req.Header.Set("anthropic-version", anthropicVersion)
-
-		resp, err := b.claudeClient.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		respBody, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("read response: %w", err)
-			continue
-		}
-
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("anthropic API status %d", resp.StatusCode)
-			if wait := retryAfter(resp.Header.Get("Retry-After")); wait > 0 {
-				select {
-				case <-time.After(wait):
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-			}
-			continue
-		}
-
-		var cr claudeResponse
-		if err := json.Unmarshal(respBody, &cr); err != nil {
-			return nil, fmt.Errorf("anthropic API status %d: unparseable response: %w", resp.StatusCode, err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			if cr.Error != nil {
-				return nil, fmt.Errorf("anthropic API status %d: %s: %s", resp.StatusCode, cr.Error.Type, cr.Error.Message)
-			}
-			return nil, fmt.Errorf("anthropic API status %d", resp.StatusCode)
-		}
-		return &cr, nil
-	}
-	return nil, fmt.Errorf("after %d attempts: %w", attempts, lastErr)
-}
-
-func retryAfter(header string) time.Duration {
-	secs, err := strconv.Atoi(header)
-	if err != nil || secs <= 0 || secs > 60 {
-		return 0
-	}
-	return time.Duration(secs) * time.Second
 }
 
 // splitMessage breaks text into chunks of at most limit runes, preferring to
@@ -536,7 +827,7 @@ func (b *bot) tgCall(ctx context.Context, method string, params any, out any) er
 		body = bytes.NewReader(data)
 	}
 
-	url := "https://api.telegram.org/bot" + b.cfg.telegramToken + "/" + method
+	url := b.cfg.apiBase + "/bot" + b.cfg.telegramToken + "/" + method
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return fmt.Errorf("%s: %w", method, err)
@@ -568,11 +859,12 @@ func (b *bot) tgCall(ctx context.Context, method string, params any, out any) er
 	return nil
 }
 
-// redact removes the bot token from error text before logging. Transport
-// errors (*url.Error) embed the full request URL, which contains the token.
+// redact removes secrets from error text before logging. Transport errors
+// (*url.Error) embed the full request URL, which contains the Telegram
+// token; claude stderr could conceivably echo the OAuth token.
 func (b *bot) redact(err error) string {
 	if err == nil {
 		return ""
 	}
-	return strings.ReplaceAll(err.Error(), b.cfg.telegramToken, "[REDACTED]")
+	return b.redactor.Replace(err.Error())
 }
