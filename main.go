@@ -39,6 +39,13 @@ const (
 	// a prompt that coaxes Claude into a huge dump can't flood the chat.
 	maxReplyParts = 4
 
+	// blockedReplyCooldown is the initial interval between access-denied
+	// replies in one chat; it doubles per reply up to blockedReplyMax, so a
+	// legit user discovers their ID instantly while a hostile group the bot
+	// was dumped into decays to a few replies a day.
+	blockedReplyCooldown = time.Minute
+	blockedReplyMax      = 6 * time.Hour
+
 	// pollTimeout is the getUpdates long-poll duration in seconds.
 	pollTimeout = 50
 
@@ -397,6 +404,10 @@ type bot struct {
 	// redactor strips secrets from anything we log.
 	redactor *strings.Replacer
 
+	// blocked rate-limits the access-denied replies per chat.
+	blockedMu sync.Mutex
+	blocked   map[int64]*blockedState
+
 	// tgClient's timeout must exceed pollTimeout or long polls would be
 	// cancelled by our own client.
 	tgClient *http.Client
@@ -441,6 +452,7 @@ func main() {
 		}),
 		sem:      make(chan struct{}, maxConcurrent),
 		redactor: strings.NewReplacer(redactPairs...),
+		blocked:  make(map[int64]*blockedState),
 		tgClient: &http.Client{Timeout: (pollTimeout + 20) * time.Second},
 	}
 	b.sessions.cleanup = b.cleanupSession
@@ -593,16 +605,78 @@ func (b *bot) pollLoop() {
 				continue
 			}
 			if !b.allowed(msg) {
-				// Drop silently (replying would invite probing). Checking
-				// after promptFor means only messages the bot would have
-				// answered are logged — not bystander group chatter — and
-				// the log line gives the operator the IDs to allowlist.
-				log.Printf("blocked message from user %s in chat %s",
-					idLabel(msg.From.ID, msg.From.Username), idLabel(msg.Chat.ID, msg.Chat.Username))
+				// Checking after promptFor means only messages the bot
+				// would have answered are handled here — not bystander
+				// group chatter.
+				b.noteBlocked(msg)
 				continue
 			}
 			go b.handleMessage(msg, prompt)
 		}
+	}
+}
+
+// blockedState is one chat's access-denied reply throttle: no reply before
+// until, and the next quiet period doubles per reply up to blockedReplyMax.
+type blockedState struct {
+	until   time.Time
+	backoff time.Duration
+}
+
+// noteBlocked logs a blocked message and, unless the chat is in cooldown,
+// replies with the IDs needed to get allowlisted. Replies are rate-limited
+// per chat with exponential backoff so strangers can't use the bot as a
+// spam machine (or make it flood a group it was dumped into); the check is
+// synchronous so a flood costs no goroutines.
+func (b *bot) noteBlocked(msg *tgMessage) {
+	log.Printf("blocked message from user %s in chat %s",
+		idLabel(msg.From.ID, msg.From.Username), idLabel(msg.Chat.ID, msg.Chat.Username))
+
+	now := time.Now()
+	b.blockedMu.Lock()
+	st := b.blocked[msg.Chat.ID]
+	if st != nil && now.Before(st.until) {
+		b.blockedMu.Unlock()
+		return
+	}
+	// Bound the map by pruning expired entries; live cooldowns are kept, so
+	// an attacker filling the map from many chats can't reset them.
+	if len(b.blocked) >= 1024 {
+		for id, s := range b.blocked {
+			if now.After(s.until) {
+				delete(b.blocked, id)
+			}
+		}
+	}
+	if st == nil {
+		st = &blockedState{backoff: blockedReplyCooldown}
+		b.blocked[msg.Chat.ID] = st
+	}
+	st.until = now.Add(st.backoff)
+	st.backoff = min(st.backoff*2, blockedReplyMax)
+	b.blockedMu.Unlock()
+
+	go b.replyBlocked(msg)
+}
+
+// replyBlocked sends the access-denied reply; the sender's own IDs are the
+// only detail included (naming config variables would fingerprint the bot
+// for anyone probing it).
+func (b *bot) replyBlocked(msg *tgMessage) {
+	text := fmt.Sprintf("Sorry, you're not on this bot's allowlist. Your user ID: %d.", msg.From.ID)
+	if msg.Chat.Type != "private" {
+		text += fmt.Sprintf(" This chat's ID: %d.", msg.Chat.ID)
+	}
+	text += " Ask the bot's owner to allowlist you."
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := b.sendMessage(ctx, msg.Chat.ID, text, msg.MessageID); err != nil {
+		log.Printf("blocked notice (chat %d): %v", msg.Chat.ID, b.redact(err))
+		// Don't burn the cooldown on a failed send — let a retry through.
+		b.blockedMu.Lock()
+		delete(b.blocked, msg.Chat.ID)
+		b.blockedMu.Unlock()
 	}
 }
 

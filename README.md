@@ -10,9 +10,12 @@ binary at runtime).
 - Uses **long-polling** (`getUpdates`) — no webhook, no inbound port, works
   behind NAT without a public IP.
 - **Access control (fail-closed):** only messages from `ALLOWED_USERS` or in
-  `ALLOWED_CHATS` are processed; everything else is silently dropped and
-  logged with the sender/chat IDs. The bot refuses to start with no
-  allowlist unless `ALLOW_ALL=true` is set explicitly.
+  `ALLOWED_CHATS` are answered by Claude. A blocked message gets a short
+  reply with the sender's user ID (and, in groups, the chat ID) so getting
+  allowlisted is self-service — rate-limited per chat with exponential
+  backoff (1 min doubling to 6 h), so if several people are denied at once
+  only the first gets the reply — and is also logged. The bot refuses to
+  start with no allowlist unless `ALLOW_ALL=true` is set explicitly.
 - **Private chats:** replies to every message (from an allowed user).
 - **Group chats:** replies only when the bot is `@mentioned` (the mention is
   detected via Telegram message entities and stripped before the text is sent
@@ -62,14 +65,15 @@ Docker, you can skip the token entirely if you have already run
 `claude login` — the CLI will use your stored credentials.
 
 At least one of `ALLOWED_USERS` / `ALLOWED_CHATS` must be set (or
-`ALLOW_ALL=true`); otherwise the bot exits at startup. To find an ID, start
-the bot while you are **not** yet allowlisted (e.g. `ALLOWED_USERS=@nobody`),
-send it a message, and read the IDs from the `blocked message from user …`
-log line; group/channel IDs are negative (the bot rejects entries whose sign
-doesn't match the list at startup). Prefer numeric IDs — usernames can be
-changed or reassigned, and a freed chat @username could be claimed by
-someone else. Note that allowing a chat allows *every member* of that chat,
-so think twice before allowlisting a public group.
+`ALLOW_ALL=true`); otherwise the bot exits at startup. To find an ID, just
+message the bot (mention it in groups) while not yet allowlisted — the
+access-denied reply contains your user ID (plus the chat's ID in groups; in
+private chat they're the same number), and the same IDs appear in the bot's
+log. Group/channel IDs are negative (the bot rejects
+entries whose sign doesn't match the list at startup). Prefer numeric IDs —
+usernames can be changed or reassigned, and a freed chat @username could be
+claimed by someone else. Note that allowing a chat allows *every member* of
+that chat, so think twice before allowlisting a public group.
 
 For group mentions to work in all messages, either mention the bot explicitly
 or disable BotFather's *Group Privacy* mode so the bot can see group messages

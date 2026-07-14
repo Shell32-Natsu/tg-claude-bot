@@ -62,6 +62,14 @@ Watch the bot log for `session … created`, `session … expired (idle > 1m0s)`
 
 ## Gotchas
 
+- When running several fake-server cases back to back, `kill $PID` of a
+  `( ... ) &` subshell does NOT kill the server child — the next case's
+  server then fails with `bind: address already in use` and the bot talks
+  to the half-dead old server (looks like a product hang; it isn't). Kill
+  by exact name (`pkill -x faketg2` — never `pkill -f`, which matches and
+  kills your own shell), and grep the server log for "listening" before
+  starting the bot.
+
 - The sandbox blocks api.anthropic.com and home-directory writes — run the
   bot and claude outside the sandbox.
 - `ls` on an empty dir exits 0; don't use `ls path/*/ && echo non-empty`.
